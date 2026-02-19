@@ -157,7 +157,7 @@ ids_global = None
 @app.on_event("startup")
 async def startup():
     global embeddings_global, ids_global
-    embeddings_global, ids_global = charger_fichiers()
+    try:`n    embeddings_global, ids_global = charger_fichiers()`nexcept Exception as e:`n    print(f"ERREUR DEMARRAGE: {e}")`n    raise
     print("API prête !")
 
 @app.get("/")
