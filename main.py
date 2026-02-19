@@ -56,7 +56,7 @@ def charger_fichiers():
         telecharger_drive(DRIVE_INDEX, INDEX_LOCAL)
     print("Fichiers chargés !")
 
-    embeddings = np.load(EMBEDDINGS_LOCAL)
+    embeddings = np.load(EMBEDDINGS_LOCAL, allow_pickle=True)
     with open(INDEX_LOCAL, "r", encoding="utf-8") as f:
         ids = json.load(f)
     return embeddings, ids
