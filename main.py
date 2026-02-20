@@ -1,9 +1,7 @@
-import io
 import os
 import json
 import base64
 import requests
-import pdfplumber
 import fitz
 import numpy as np
 from openai import OpenAI
@@ -15,15 +13,11 @@ from pydantic import BaseModel
 OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "")
 DRIVE_CATALOGUE  = "1TP1X8JQW02ujnV7CGC44tiBAr6ZjXXqM"
 DRIVE_INDEX      = "1wBKObHcLEN6Pg39MxUDFACjQqcZupZ2P"
-DRIVE_PARTS      = [
-    "169AqzqPQI-u7oGlBngZbXF0g6Qy1L661",
-    "1v8NCmdQzo5AbUUgOWVH-ntR61bPuR_lj",
-    "1tpU2aHW1EdbJqsc1YLb9OsMAV8b7MQNc",
-    "1UCO1GR6h5pX4ADzVcUIaBV3pPOi6Hfz7",
-]
+DRIVE_EMBEDDINGS = "1S1ziEg6rbGd8p_oYR2C3z6JEPPg6vDJZ"
 
-PDF_LOCAL   = "/tmp/catalogue.pdf"
-INDEX_LOCAL = "/tmp/index.json"
+PDF_LOCAL        = "/tmp/catalogue.pdf"
+INDEX_LOCAL      = "/tmp/index.json"
+EMBEDDINGS_LOCAL = "/tmp/embeddings_256.json"
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -51,28 +45,19 @@ def telecharger_drive(file_id, destination):
 
 def charger_fichiers():
     print("Chargement des fichiers depuis Google Drive...")
-
     if not os.path.exists(PDF_LOCAL):
         print("  Téléchargement catalogue PDF...")
         telecharger_drive(DRIVE_CATALOGUE, PDF_LOCAL)
-
     if not os.path.exists(INDEX_LOCAL):
         print("  Téléchargement index...")
         telecharger_drive(DRIVE_INDEX, INDEX_LOCAL)
+    if not os.path.exists(EMBEDDINGS_LOCAL):
+        print("  Téléchargement embeddings...")
+        telecharger_drive(DRIVE_EMBEDDINGS, EMBEDDINGS_LOCAL)
 
-    # Téléchargement et fusion des 4 parties d'embeddings
-    tous_embeddings = []
-    for i, drive_id in enumerate(DRIVE_PARTS, start=1):
-        part_path = f"/tmp/embeddings_part{i}.json"
-        if not os.path.exists(part_path):
-            print(f"  Téléchargement embeddings partie {i}/4...")
-            telecharger_drive(drive_id, part_path)
-        print(f"  Chargement partie {i}/4...")
-        with open(part_path, "r", encoding="utf-8") as f:
-            tous_embeddings.extend(json.load(f))
-
-    embeddings = np.array(tous_embeddings, dtype=np.float32)
-
+    print("  Chargement en mémoire...")
+    with open(EMBEDDINGS_LOCAL, "r", encoding="utf-8") as f:
+        embeddings = np.array(json.load(f), dtype=np.float32)
     with open(INDEX_LOCAL, "r", encoding="utf-8") as f:
         ids = json.load(f)
 
@@ -83,7 +68,8 @@ def charger_fichiers():
 def chercher_semantique(question, embeddings, ids, n=5):
     response = client.embeddings.create(
         model="text-embedding-3-small",
-        input=[question]
+        input=[question],
+        dimensions=256
     )
     q_embedding = np.array(response.data[0].embedding, dtype=np.float32)
     normes = np.linalg.norm(embeddings, axis=1)
