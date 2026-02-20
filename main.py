@@ -7,15 +7,18 @@ import pdfplumber
 import fitz
 import numpy as np
 from openai import OpenAI
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # Configuration
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-DRIVE_CATALOGUE = "1TP1X8JQW02ujnV7CGC44tiBAr6ZjXXqM"
-DRIVE_EMBEDDINGS = "1jHlKBZz4yKxTu9VAaOJohli1Su8qfWlc"
-DRIVE_INDEX     = "1wBKObHcLEN6Pg39MxUDFACjQqcZupZ2P"
+OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "")
+DRIVE_CATALOGUE  = "1TP1X8JQW02ujnV7CGC44tiBAr6ZjXXqM"
+DRIVE_EMBEDDINGS = "1B4ck7G2vmnSL_JyIy5ENPZlpSpUEGmiC"
+DRIVE_INDEX      = "1wBKObHcLEN6Pg39MxUDFACjQqcZupZ2P"
 
 PDF_LOCAL        = "/tmp/catalogue.pdf"
-EMBEDDINGS_LOCAL = "/tmp/embeddings.npy"
+EMBEDDINGS_LOCAL = "/tmp/embeddings.json"
 INDEX_LOCAL      = "/tmp/index.json"
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -31,7 +34,6 @@ def telecharger_drive(file_id, destination):
     url = f"https://drive.google.com/uc?export=download&id={file_id}"
     session = requests.Session()
     response = session.get(url, stream=True)
-    # Gestion du warning Google pour les gros fichiers
     token = None
     for key, value in response.cookies.items():
         if key.startswith("download_warning"):
@@ -46,19 +48,23 @@ def telecharger_drive(file_id, destination):
 def charger_fichiers():
     print("Chargement des fichiers depuis Google Drive...")
     if not os.path.exists(PDF_LOCAL):
-        print("  Téléchargement du catalogue PDF...")
+        print("  Téléchargement catalogue PDF...")
         telecharger_drive(DRIVE_CATALOGUE, PDF_LOCAL)
     if not os.path.exists(EMBEDDINGS_LOCAL):
-        print("  Téléchargement des embeddings...")
+        print("  Téléchargement embeddings...")
         telecharger_drive(DRIVE_EMBEDDINGS, EMBEDDINGS_LOCAL)
     if not os.path.exists(INDEX_LOCAL):
-        print("  Téléchargement de l'index...")
+        print("  Téléchargement index...")
         telecharger_drive(DRIVE_INDEX, INDEX_LOCAL)
-    print("Fichiers chargés !")
 
-    embeddings = np.load(EMBEDDINGS_LOCAL, allow_pickle=True)
+    print("  Chargement en mémoire...")
+    with open(EMBEDDINGS_LOCAL, "r", encoding="utf-8") as f:
+        embeddings = np.array(json.load(f), dtype=np.float32)
+
     with open(INDEX_LOCAL, "r", encoding="utf-8") as f:
         ids = json.load(f)
+
+    print(f"Prêt ! {len(embeddings)} morceaux indexés.")
     return embeddings, ids
 
 
@@ -143,11 +149,7 @@ def poser_question(embeddings, ids, question):
     return response.choices[0].message.content
 
 
-# Point d'entrée API (pour Render)
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-
+# API FastAPI
 app = FastAPI(title="Chatbot Catalogue")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -157,8 +159,12 @@ ids_global = None
 @app.on_event("startup")
 async def startup():
     global embeddings_global, ids_global
-    try:`n    embeddings_global, ids_global = charger_fichiers()`nexcept Exception as e:`n    print(f"ERREUR DEMARRAGE: {e}")`n    raise
-    print("API prête !")
+    try:
+        embeddings_global, ids_global = charger_fichiers()
+        print("Démarrage OK !")
+    except Exception as e:
+        print(f"ERREUR DEMARRAGE: {e}")
+        raise
 
 @app.get("/")
 def accueil():
