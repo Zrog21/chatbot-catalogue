@@ -970,136 +970,80 @@ def generer_question_bienvenue():
     import random
     return random.choice(suggestions_bienvenue)
 
-# ── Session state — Agent avec mémoire ────────────────────────────────────────
-historique_conversation = []
+# ── Session state ─────────────────────────────────────────────────────────────
+historique_conversation = []        # Full Q+A history as OpenAI messages format
 historique_recherches   = {}
-MAX_HIST                = 8
+MAX_HIST                = 20        # Keep 20 messages (10 exchanges) — like ChatGPT
 derniere_page_trouvee   = None
 lastReference_backend   = [None]
-# Agent memory
-derniers_chunks_trouves = []       # Last RAG chunks found (for follow-up)
+derniers_chunks_trouves = []       # Last RAG chunks found
 dernier_contexte_envoye = ""       # Last context sent to LLM
-resume_conversation     = ""       # Running summary of conversation
-derniere_question       = ""       # Last user question (for follow-up detection)
+resume_conversation     = ""       # Kept for backward compat
+derniere_question       = ""       # Last user question
 derniere_propose_web    = False    # Whether last response proposed web search
 
 # ── Conversation Memory ──
-# Stores compressed exchanges as context for the LLM. No hardcoded patterns.
-conversation_exchanges = []  # [{q, r, refs, timestamp}] — last 10 exchanges (compressed)
-MAX_EXCHANGES = 10
-
-def memory_add_exchange(question, reponse, refs_found=None):
-    """Add a compressed exchange to memory. Responses are compressed to save tokens."""
-    global conversation_exchanges
-    # Extract refs from both Q and R
-    all_refs = re.findall(r'\b([A-Z]{1,5}\d{2,6}[A-Z0-9]*)\b', (question + " " + (reponse or ""))[:1000])
-    refs = list(dict.fromkeys(all_refs))[:5]  # Dedupe, keep order, max 5
-
-    # Compress response: keep first 150 chars (key answer) — enough for context, cheap on tokens
-    r_compressed = reponse[:150].replace("\n", " ").strip() if reponse else ""
-
-    conversation_exchanges.append({
-        "q": question[:200],
-        "r": r_compressed,
-        "refs": refs,
-    })
-    # Compress older exchanges more aggressively (keep only refs + short summary)
-    if len(conversation_exchanges) > MAX_EXCHANGES:
-        conversation_exchanges = conversation_exchanges[-MAX_EXCHANGES:]
-    # Further compress exchanges older than 5: reduce response to 50 chars
-    for i, ex in enumerate(conversation_exchanges):
-        if i < len(conversation_exchanges) - 5:
-            ex["r"] = ex["r"][:50]
-            ex["q"] = ex["q"][:100]
-    print(f"[MEMORY] {len(conversation_exchanges)} échanges, refs={refs[:3]}")
-
-def memory_get_context_block():
-    """Build a compact conversation context block from stored exchanges.
-    Injected into every LLM call. Optimized for minimal token usage."""
-    if not conversation_exchanges:
-        return ""
-    lines = ["HISTORIQUE CONVERSATION:"]
-    for i, ex in enumerate(conversation_exchanges):
-        ref_tag = f" [refs:{','.join(ex['refs'])}]" if ex['refs'] else ""
-        lines.append(f"{i+1}. Q:{ex['q']} → R:{ex['r']}{ref_tag}")
-    lines.append("---")
-    lines.append("REGLE: Utilise cet historique pour comprendre le contexte. "
-                  "Quand l'utilisateur dit 'une autre', 'en bleu', 'version X', 'donne la version', etc. "
-                  "il fait reference aux produits/refs des echanges precedents. "
-                  "Reponds en tenant compte de TOUT l'historique.")
-    return "\n".join(lines)
-
-def memory_get_search_context():
-    """Extract key terms from recent exchanges for enriching RAG search queries."""
-    if not conversation_exchanges:
-        return ""
-    # Get refs and key terms from last 2 exchanges
-    parts = []
-    for ex in conversation_exchanges[-2:]:
-        if ex['refs']:
-            parts.extend(ex['refs'])
-        # Extract brand names mentioned
-        for m in ["Snap-on", "Facom", "Totech", "EGA Master", "Bahco", "Beta", "Stahlwille", "Knipex", "Wera"]:
-            if m.lower() in ex['q'].lower() or m.lower() in ex['r'].lower():
-                parts.append(m)
-    return " ".join(dict.fromkeys(parts))  # Dedupe
+# Architecture identique à ChatGPT/Claude/LangChain:
+# - L'historique complet Q+R est dans historique_conversation (format OpenAI messages)
+# - Il est passé tel quel au LLM à chaque appel — le LLM comprend le contexte
+# - Pour le RAG, on reformule la question en standalone AVANT la recherche vectorielle
 
 def memory_get_active_ref():
-    """Get the most recent reference from exchanges."""
-    for ex in reversed(conversation_exchanges):
-        if ex['refs']:
-            return ex['refs'][0]
+    """Get the most recent reference from conversation history."""
+    for h in reversed(historique_conversation):
+        if h["role"] == "assistant":
+            refs = re.findall(r'\b([A-Z]{1,5}\d{2,6}[A-Z0-9]*)\b', str(h["content"])[:500])
+            if refs:
+                return refs[0]
     return None
 
-def reformuler_question_avec_contexte(question):
-    """Use GPT to reformulate any question as a standalone query using conversation history.
-    No hardcoded patterns — the LLM understands context naturally."""
-    ctx_block = memory_get_context_block()
-    if not ctx_block:
-        return question  # No history yet, nothing to reformulate
+def reformuler_pour_recherche(question, historique):
+    """Reformulate a question into a standalone search query using conversation history.
+    This is the standard LangChain 'history-aware retriever' pattern.
+    Only called for RAG search — the main LLM gets the full history directly."""
+    if not historique:
+        return question  # No history, nothing to reformulate
+
+    # Build a compact history for the reformulation LLM
+    history_msgs = []
+    for h in historique[-10:]:  # Last 10 messages (5 exchanges)
+        history_msgs.append({"role": h["role"], "content": str(h["content"])[:300]})
 
     try:
         r = client.chat.completions.create(
             model="gpt-4o-mini", max_tokens=200,
             messages=[
-                {"role":"system","content":
-                    "Tu es un assistant qui reformule des questions pour les rendre autonomes. "
-                    "L'utilisateur discute d'outillage professionnel (Snap-on, Facom, etc). "
-                    "Tu reçois l'historique de conversation et la nouvelle question. "
-                    "Si la question fait référence à un échange précédent, reformule-la en incluant "
-                    "les références produit, la marque, le type de produit, etc. "
+                {"role": "system", "content":
+                    "Étant donné l'historique de conversation et la dernière question de l'utilisateur "
+                    "qui peut faire référence au contexte de l'historique, "
+                    "reformule la question en une question AUTONOME compréhensible SANS l'historique. "
                     "Si la question est déjà autonome (nouveau sujet), retourne-la telle quelle. "
-                    "Reponds UNIQUEMENT avec la question reformulée, rien d'autre."},
-                {"role":"user","content":
-                    f"{ctx_block}\n\n"
-                    f"Nouvelle question: {question}\n\n"
-                    f"Question reformulée:"}
+                    "Réponds UNIQUEMENT avec la question reformulée, rien d'autre. "
+                    "IMPORTANT: inclus les références produit, marques et types de produit mentionnés dans l'historique."},
+                *history_msgs,
+                {"role": "user", "content": question}
             ]
         )
-        reformulee = r.choices[0].message.content.strip()
-        if reformulee and len(reformulee) > 3:
-            print(f"[MEMORY] Reformulation: '{question}' -> '{reformulee}'")
-            return reformulee
-        return question
+        result = r.choices[0].message.content.strip()
+        if result and len(result) > 2 and result != question:
+            print(f"[RAG] Reformulation: '{question}' → '{result}'")
+            return result
     except Exception as e:
-        print(f"[MEMORY] Reformulation error: {e}")
-        # Fallback: append search context from memory
-        search_ctx = memory_get_search_context()
-        if search_ctx:
-            return f"{question} {search_ctx}"
-        return question
+        print(f"[RAG] Reformulation error: {e}")
+
+    # Fallback: append recent refs to the question
+    for h in reversed(historique[-6:]):
+        refs = re.findall(r'\b([A-Z]{1,5}\d{2,6}[A-Z0-9]*)\b', str(h["content"])[:300])
+        if refs:
+            return f"{question} {' '.join(refs[:2])}"
+            break
+    return question
+
 
 def mettre_a_jour_resume(question, reponse_courte):
-    """Update conversation memory with this exchange."""
+    """Update resume for backward compat."""
     global resume_conversation
-    # Add to compressed exchange memory
-    memory_add_exchange(question, reponse_courte)
-    # Keep resume_conversation for backward compat
     resume_conversation = f"Q: {question[:150]} | R: {reponse_courte[:200]}"
-    ref = extraire_reference_from_text(reponse_courte)
-    if ref:
-        resume_conversation += f" | Ref: {ref}"
-    print(f"[MEMORY] Resume mis à jour, {len(conversation_exchanges)} échanges stockés")
 
 def clean_markdown(text):
     """Remove ALL markdown formatting from text for clean display."""
@@ -1153,35 +1097,33 @@ def extraire_reference_from_text(text):
     return refs[0] if refs else ""
 
 def build_llm_messages(system_prompt, question, contexte, historique, use_previous_context=False):
-    """Build LLM messages with conversation history. ALWAYS injects conversation memory."""
+    """Build LLM messages with FULL conversation history — like ChatGPT/Claude.
+    The LLM sees the complete conversation and understands context naturally."""
     full_system = system_prompt + "\n\n"
     full_system += (
-        "RÈGLE ABSOLUE: ta réponse doit UNIQUEMENT contenir la réponse à la question de l'utilisateur. "
-        "Ne JAMAIS mentionner, citer ou répéter le résumé de conversation, le contexte précédent, "
-        "les extraits bruts, ou la question reformulée. Ne JAMAIS commencer par 'L'utilisateur s'est renseigné sur...' "
-        "ou tout autre récapitulatif. Réponds directement à la question.\n"
-        "FORMATAGE: Texte simple et clair. PAS de ### ni ## ni #. PAS de ** ni *. "
-        "Termine TOUJOURS tes phrases (ne les coupe jamais en plein milieu). "
-        "Ne répète PAS la même information avec des formulations différentes. Sois concis et direct. "
-        "PAS de markdown. Utilise des phrases complètes.\n\n"
+        "RÈGLE: Réponds DIRECTEMENT à la question. Pas de récapitulatif. "
+        "Texte simple, PAS de markdown (###, **, etc). Phrases complètes. Concis et direct.\n\n"
     )
-
-    # ALWAYS inject conversation memory — the LLM needs context for ALL questions
-    ctx_block = memory_get_context_block()
-    if ctx_block:
-        full_system += ctx_block + "\n\n"
-    # Also inject previous RAG extracts if available (for follow-ups)
-    if use_previous_context and dernier_contexte_envoye:
-        full_system += "EXTRAITS PRÉCÉDENTS:\n" + dernier_contexte_envoye[:1500] + "\n\n"
 
     msgs = [{"role":"system","content":full_system}]
 
-    # Conversation history — limit to recent context only
-    # Only include last 4 exchanges to reduce topic contamination
-    for h in historique[-4:]:
-        msgs.append({"role":h["role"],"content":str(h["content"])[:500]})
+    # FULL conversation history — the LLM needs this to understand "donne une autre", "en bleu", etc.
+    # Keep last 10 exchanges (20 messages). Truncate old messages to save tokens.
+    recent = historique[-MAX_HIST:]
+    for i, h in enumerate(recent):
+        content = str(h["content"])
+        # Compress older messages more (first half of history)
+        if i < len(recent) // 2:
+            content = content[:400]
+        else:
+            content = content[:800]
+        msgs.append({"role": h["role"], "content": content})
 
-    # User message: only the question + new extracts
+    # Also inject previous RAG extracts if available (helps with follow-ups)
+    if use_previous_context and dernier_contexte_envoye:
+        msgs.append({"role":"system","content":"EXTRAITS PRÉCÉDENTS (si pertinent):\n" + dernier_contexte_envoye[:1500]})
+
+    # Current question with new RAG extracts
     msgs.append({"role":"user","content":"Extraits catalogue:\n\n" + contexte + "\n\nQuestion: " + question})
     return msgs
 
@@ -1193,21 +1135,30 @@ def poser_question(question, session_id="default", mode="catalogue"):
     q_low = question.lower()
     question_originale = question  # Keep original for history
 
-    # ── Handle "oui"/"ok" after web proposal → switch to web ──
-    if derniere_propose_web and q_low.strip() in ["oui", "ok", "d'accord", "yes", "vas-y", "vasy", "go", "oui merci"]:
-        mode = "web"
-        question = reformuler_question_avec_contexte(derniere_question or question)
-        q_low = question.lower()
-
-    # ── Reformulate question with conversation context (LLM-based, no hardcoded patterns) ──
-    # Always reformulate when we have conversation history — the LLM decides if context is needed
-    is_suivi = False  # Kept for backward compat (passed to build_llm_messages)
-    if conversation_exchanges:
-        question_reformulee = reformuler_question_avec_contexte(question)
-        if question_reformulee != question:
-            is_suivi = True
-            question = question_reformulee
+    # ── Handle acceptance of web proposal → switch to web ──
+    # Detect positive responses broadly (not just exact matches)
+    if derniere_propose_web:
+        accepte_web = q_low.strip() in ["oui", "ok", "d'accord", "yes", "vas-y", "vasy", "go", "oui merci",
+                                          "oui!", "ok!", "allez", "why not", "volontiers", "je veux bien",
+                                          "oui je veux bien", "oui vas-y", "oui svp", "oui stp", "go!"]
+        # Also accept any short positive-sounding response
+        if not accepte_web and len(question.split()) <= 4:
+            mots_positifs = ["oui", "ok", "d'accord", "yes", "go", "allez", "volontiers", "bien sûr",
+                            "parfait", "super", "envoie", "lance", "fais", "cherche", "s'il te plait"]
+            accepte_web = any(m in q_low for m in mots_positifs)
+        # Also reject if clearly negative
+        if any(m in q_low for m in ["non", "pas", "ne ", "jamais", "stop", "annul"]):
+            accepte_web = False
+        if accepte_web:
+            mode = "web"
+            # Use the original question that triggered the web proposal
+            question = derniere_question or question
             q_low = question.lower()
+
+    # ── Reformulate question for RAG search (standalone query) ──
+    # The main LLM gets full history directly. This is ONLY for the vector search.
+    is_suivi = bool(historique_conversation)  # True if we have any history
+    search_question = reformuler_pour_recherche(question, historique_conversation) if historique_conversation else question
 
     # Expand vague follow-up using history
     if any(k in q_low for k in ["explorer la gamme","gamme complete","toutes les variantes"]):
@@ -1330,8 +1281,7 @@ def poser_question(question, session_id="default", mode="catalogue"):
         if prev_ref and not re.search(r'[A-Z]{1,5}\d{2,6}', question.upper()):
             # User asks for image without specifying a ref → use previous ref
             mode = "web"
-            search_ctx = memory_get_search_context()
-            question = f"Image du produit {search_ctx} {prev_ref}".strip()
+            question = f"Image du produit {prev_ref}".strip()
             q_low = question.lower()
             demande_image = False
             print(f"[AGENT] Image → web avec ref: {question}")
@@ -1385,13 +1335,7 @@ def poser_question(question, session_id="default", mode="catalogue"):
 
     # ── Main catalogue search with RAG ──
     # When it's a follow-up with a vague query, enrich the SEARCH query
-    # Enrich search query with memory context (refs, brands from recent exchanges)
-    search_question = question
-    search_ctx = memory_get_search_context()
-    has_ref_in_q = bool(re.search(r'\b[A-Z]{1,5}\d{2,6}[A-Z0-9]*\b', question))
-    if search_ctx and not has_ref_in_q:
-        search_question = f"{question} {search_ctx}"
-        print(f"[RAG] Enriched search: {search_question[:80]}")
+    # search_question was already reformulated above (reformuler_pour_recherche)
     
     query_en = traduire_query(search_question)
     n_chunks = 20 if large else 15  # Fetch more, then rerank
@@ -1609,11 +1553,8 @@ def poser_question(question, session_id="default", mode="catalogue"):
 
     # ── Mode web ──────────────────────────────────────────────────────────────
     elif mode == "web":
-        # Build web query — enrich with memory context
-        web_query = question
-        search_ctx = memory_get_search_context()
-        if search_ctx:
-            web_query = f"{question} {search_ctx}"
+        # Build web query — use the reformulated standalone question
+        web_query = search_question
         web = recherche_perplexity(web_query)
         if web:
             reponse           = clean_markdown(web)
@@ -1649,19 +1590,9 @@ def poser_question(question, session_id="default", mode="catalogue"):
                     if p["page"] not in pages_vues: pages_vues.append(p["page"])
                     if len(pages_vues) >= 3: break
 
-                # System prompt enriched with memory (hidden)
+                # System prompt
                 vision_system = system + "\n\n"
-                vision_system += (
-                    "REGLE ABSOLUE: reponds UNIQUEMENT a la question. "
-                    "Ne JAMAIS reciter le resume, le contexte precedent ou les extraits bruts. "
-                    "Reponds directement.\n\n"
-                )
-                # Inject conversation memory
-                ctx_block = memory_get_context_block()
-                if ctx_block:
-                    vision_system += ctx_block + "\n\n"
-                if is_suivi and dernier_contexte_envoye:
-                    vision_system += "EXTRAITS PRÉCÉDENTS:\n" + dernier_contexte_envoye[:1500] + "\n\n"
+                vision_system += "RÈGLE: Réponds DIRECTEMENT. Texte simple, pas de markdown.\n\n"
 
                 text_part = "Extraits catalogue:\n\n" + contexte + "\n\nQuestion: " + question
 
@@ -1674,9 +1605,10 @@ def poser_question(question, session_id="default", mode="catalogue"):
                     except Exception:
                         pass
 
+                # Full conversation history — the LLM sees everything
                 hist_msgs_base = [{"role":"system","content":vision_system}]
-                for h in historique_conversation[-6:]:
-                    hist_msgs_base.append({"role":h["role"],"content":str(h["content"])})
+                for h in historique_conversation[-MAX_HIST:]:
+                    hist_msgs_base.append({"role":h["role"],"content":str(h["content"])[:600]})
                 msgs_vision = hist_msgs_base[:]
                 msgs_vision.append({"role":"user","content":contenu})
                 try:
@@ -1726,7 +1658,7 @@ def poser_question(question, session_id="default", mode="catalogue"):
         derniere_propose_web = True
         # Save state before returning
         historique_conversation.append({"role":"user","content":question_originale})
-        historique_conversation.append({"role":"assistant","content":reponse[:200] if reponse else "Non trouvé"})
+        historique_conversation.append({"role":"assistant","content":reponse[:600] if reponse else "Non trouvé"})
         if len(historique_conversation) > MAX_HIST * 2:
             historique_conversation.pop(0); historique_conversation.pop(0)
         derniere_question = question_originale
@@ -2639,7 +2571,8 @@ function envoyer(){
   msgs.appendChild(um);msgs.scrollTop=msgs.scrollHeight;
   inp.value='';sbtn.disabled=true;
   var attente=document.createElement('div');attente.className='m b';
-  attente.innerHTML='<div class="msg-body" style="color:#aaa;font-style:italic">Recherche en cours...<br><a class="cancel-link" style="font-size:11px;color:#bbb;cursor:pointer;text-decoration:none;transition:color 0.15s">Annuler</a></div>';
+  var searchLabel=currentMode==='web'?'Recherche internet en cours...':'Recherche catalogue en cours...';
+  attente.innerHTML='<div class="msg-body" style="color:#aaa;font-style:italic">'+searchLabel+'<br><a class="cancel-link" style="font-size:11px;color:#bbb;cursor:pointer;text-decoration:none;transition:color 0.15s">Annuler</a></div>';
   msgs.appendChild(attente);msgs.scrollTop=msgs.scrollHeight;
   var activeXhr=null;
   attente.querySelector('.cancel-link').onclick=function(){if(activeXhr){activeXhr.abort();attente.remove();sbtn.disabled=false;inp.focus();}};
