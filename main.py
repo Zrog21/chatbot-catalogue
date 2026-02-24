@@ -49,7 +49,7 @@ BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
 PDF_LOCAL        = os.path.join(BASE_DIR, "catalogue.pdf")
 FICHE_TEMPLATE   = os.path.join(BASE_DIR, "fiche_template.pdf")
 INDEX_LOCAL      = os.path.join(BASE_DIR, "index_catalogue.json")
-EMBEDDINGS_LOCAL = os.path.join(BASE_DIR, "embeddings.json")
+EMBEDDINGS_LOCAL = os.path.join(BASE_DIR, "embeddings_catalogue.npy")
 CHROMA_DIR       = os.path.join(BASE_DIR, "chroma_db")
 SQLITE_DB        = os.path.join(BASE_DIR, "excel_data.db")
 
@@ -2042,15 +2042,10 @@ def charger_fichiers():
     with open(INDEX_LOCAL, "r", encoding="utf-8") as f:
         ids = json.load(f)
 
-    # Load embeddings — support both .npy (new) and .json (legacy) formats
-    npy_path = os.path.join(BASE_DIR, "embeddings_catalogue.npy")
-    if os.path.exists(npy_path):
-        legacy_embeddings = np.load(npy_path).astype(np.float32)
-        print(f"[BOOT] Loaded .npy embeddings: {legacy_embeddings.shape}")
-    elif os.path.exists(EMBEDDINGS_LOCAL):
-        with open(EMBEDDINGS_LOCAL, "r", encoding="utf-8") as f:
-            legacy_embeddings = np.array(json.load(f), dtype=np.float32)
-        print(f"[BOOT] Loaded .json embeddings: {legacy_embeddings.shape}")
+    # Load embeddings (.npy format)
+    if os.path.exists(EMBEDDINGS_LOCAL):
+        legacy_embeddings = np.load(EMBEDDINGS_LOCAL).astype(np.float32)
+        print(f"[BOOT] Loaded embeddings: {legacy_embeddings.shape}")
     else:
         print("[BOOT] WARNING: No embeddings file found!")
         legacy_embeddings = None
