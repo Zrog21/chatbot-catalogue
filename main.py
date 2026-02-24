@@ -984,328 +984,122 @@ derniere_question       = ""       # Last user question (for follow-up detection
 derniere_propose_web    = False    # Whether last response proposed web search
 
 # ── Conversation Memory ──
-# Simple but effective: track the ACTIVE topic/product, not history of all products
-session_memory = {
-    "active_ref": None,       # Currently discussed reference (e.g. "T72FOD")
-    "active_marque": "",      # Currently discussed brand
-    "active_topic": "",       # Current topic summary (e.g. "cliquet Snap-on T72FOD")
-    "active_source": "",      # Source catalogue being discussed
-    "product_type": "",       # Type of product (cliquet, douille, clé, etc.)
-    "recent_refs": [],        # Last 3 references discussed
-    "last_answer": "",        # Last bot answer (first 500 chars) for rich context
-    "last_question": "",      # Last user question for context
-    "history": [],            # [{question, ref, topic, timestamp}] — last 10 exchanges
-}
+# Stores compressed exchanges as context for the LLM. No hardcoded patterns.
+conversation_exchanges = []  # [{q, r, refs, timestamp}] — last 10 exchanges (compressed)
+MAX_EXCHANGES = 10
 
-def detecter_product_type(text):
-    """Detect product type from text using keyword matching (FR+EN)."""
-    text_low = text.lower()
-    type_keywords = {
-        "cliquet": ["cliquet", "ratchet", "t72", "t36", "tl72", "thl72"],
-        "douille": ["douille", "socket", "sw", "sfs", "tms", "tm", "tsm"],
-        "clé": ["clé", "cle", "clef", "wrench", "key", "soex", "flank", "oexm", "goex"],
-        "tournevis": ["tournevis", "screwdriver", "sdd", "sgd"],
-        "pince": ["pince", "plier", "knipex"],
-        "servante": ["servante", "toolbox", "kra", "krsc", "roll cab", "coffre"],
-        "embout": ["embout", "bit", "torx", "tamper"],
-        "rallonge": ["rallonge", "extension", "fx"],
-        "marteau": ["marteau", "hammer", "hbfe", "hbbd"],
-        "extracteur": ["extracteur", "extractor", "puller"],
-        "clé dynamométrique": ["dynamométrique", "dynamometrique", "torque wrench", "techangle", "atech"],
-    }
-    for ptype, keywords in type_keywords.items():
-        if any(kw in text_low for kw in keywords):
-            return ptype
-    return ""
+def memory_add_exchange(question, reponse, refs_found=None):
+    """Add a compressed exchange to memory. Responses are compressed to save tokens."""
+    global conversation_exchanges
+    # Extract refs from both Q and R
+    all_refs = re.findall(r'\b([A-Z]{1,5}\d{2,6}[A-Z0-9]*)\b', (question + " " + (reponse or ""))[:1000])
+    refs = list(dict.fromkeys(all_refs))[:5]  # Dedupe, keep order, max 5
 
-def memory_update_active(question, reponse="", reference=None, source=""):
-    """Update active topic based on current exchange.
-    Key insight: if a new reference or topic appears, REPLACE the active topic.
-    Prefix-matching: T72 is a prefix of T72FOD → continuation, keep most specific."""
-    q_low = question.lower()
+    # Compress response: keep first 150 chars (key answer) — enough for context, cheap on tokens
+    r_compressed = reponse[:150].replace("\n", " ").strip() if reponse else ""
 
-    # Extract references from question + response
-    refs = re.findall(r'\b([A-Z]{1,5}\d{2,6}[A-Z0-9]*)\b', question + " " + (reponse or "")[:300])
-
-    # Detect brand
-    marque = ""
-    for m in ["Snap-on", "Facom", "Totech", "EGA Master", "Bahco", "Beta", "Stahlwille", "Knipex", "Wera", "CAB"]:
-        if m.lower() in q_low or m.lower() in (reponse or "").lower()[:300]:
-            marque = m
-            break
-
-    new_ref = reference or (refs[0] if refs else None)
-
-    # Detect product type from question + response
-    ptype = detecter_product_type(question + " " + (reponse or "")[:300])
-    if ptype:
-        session_memory["product_type"] = ptype
-
-    # Determine if this is a NEW topic or continuation
-    is_new_topic = False
-    active_ref = session_memory["active_ref"]
-    if new_ref and new_ref != active_ref:
-        # Check prefix-matching: if one ref is prefix of the other, it's a CONTINUATION
-        if active_ref and (active_ref.startswith(new_ref) or new_ref.startswith(active_ref)):
-            # Continuation — keep the most specific (longest) reference
-            new_ref = new_ref if len(new_ref) >= len(active_ref) else active_ref
-            print(f"[MEMORY] Prefix match: continuation, ref={new_ref}")
-        else:
-            # Truly different reference → new topic
-            is_new_topic = True
-    elif not new_ref and active_ref:
-        # No reference in question — is it a follow-up or new topic?
-        active_ref_lower = active_ref.lower()
-        question_mentions_active = (
-            active_ref_lower in q_low or
-            (session_memory["active_marque"] and session_memory["active_marque"].lower() in q_low) or
-            (session_memory["product_type"] and session_memory["product_type"] in q_low)
-        )
-        if not question_mentions_active:
-            suivi_patterns = ["c'est", "est-ce", "et la", "et le", "et les", "aussi", "même",
-                            "compatible", "version", "oui", "non", "ok", "d'accord", "merci",
-                            "quel", "combien", "pourquoi", "comment", "où", "quand",
-                            "non fod", "sans fod", "avec fod", "version fod"]
-            is_follow_up_pattern = any(p in q_low for p in suivi_patterns)
-            is_very_short = len(question.split()) <= 3
-
-            if not is_follow_up_pattern and not is_very_short:
-                is_new_topic = True
-
-    if is_new_topic or not active_ref:
-        session_memory["active_ref"] = new_ref
-        session_memory["active_marque"] = marque
-        session_memory["active_topic"] = question[:100]
-        if source:
-            session_memory["active_source"] = source
-        print(f"[MEMORY] Nouveau sujet: ref={new_ref} marque={marque} type={ptype} topic={question[:60]}")
-    else:
-        # Continuation — update ref if more specific, update marque if detected
-        if new_ref and (not active_ref or len(new_ref) > len(active_ref)):
-            session_memory["active_ref"] = new_ref
-        if marque and not session_memory["active_marque"]:
-            session_memory["active_marque"] = marque
-
-    # Update recent_refs (last 3 unique)
-    if new_ref:
-        rr = session_memory["recent_refs"]
-        if new_ref in rr:
-            rr.remove(new_ref)
-        rr.append(new_ref)
-        session_memory["recent_refs"] = rr[-3:]
-
-    # Store last Q&A for rich context
-    session_memory["last_question"] = question[:200]
-    if reponse:
-        session_memory["last_answer"] = reponse[:500]
-
-    # Add to history
-    session_memory["history"].append({
-        "question": question[:100], "ref": new_ref, "topic": session_memory["active_topic"],
-        "time": time.time()
+    conversation_exchanges.append({
+        "q": question[:200],
+        "r": r_compressed,
+        "refs": refs,
     })
-    if len(session_memory["history"]) > 10:
-        session_memory["history"] = session_memory["history"][-10:]
+    # Compress older exchanges more aggressively (keep only refs + short summary)
+    if len(conversation_exchanges) > MAX_EXCHANGES:
+        conversation_exchanges = conversation_exchanges[-MAX_EXCHANGES:]
+    # Further compress exchanges older than 5: reduce response to 50 chars
+    for i, ex in enumerate(conversation_exchanges):
+        if i < len(conversation_exchanges) - 5:
+            ex["r"] = ex["r"][:50]
+            ex["q"] = ex["q"][:100]
+    print(f"[MEMORY] {len(conversation_exchanges)} échanges, refs={refs[:3]}")
+
+def memory_get_context_block():
+    """Build a compact conversation context block from stored exchanges.
+    Injected into every LLM call. Optimized for minimal token usage."""
+    if not conversation_exchanges:
+        return ""
+    lines = ["HISTORIQUE CONVERSATION:"]
+    for i, ex in enumerate(conversation_exchanges):
+        ref_tag = f" [refs:{','.join(ex['refs'])}]" if ex['refs'] else ""
+        lines.append(f"{i+1}. Q:{ex['q']} → R:{ex['r']}{ref_tag}")
+    lines.append("---")
+    lines.append("REGLE: Utilise cet historique pour comprendre le contexte. "
+                  "Quand l'utilisateur dit 'une autre', 'en bleu', 'version X', 'donne la version', etc. "
+                  "il fait reference aux produits/refs des echanges precedents. "
+                  "Reponds en tenant compte de TOUT l'historique.")
+    return "\n".join(lines)
+
+def memory_get_search_context():
+    """Extract key terms from recent exchanges for enriching RAG search queries."""
+    if not conversation_exchanges:
+        return ""
+    # Get refs and key terms from last 2 exchanges
+    parts = []
+    for ex in conversation_exchanges[-2:]:
+        if ex['refs']:
+            parts.extend(ex['refs'])
+        # Extract brand names mentioned
+        for m in ["Snap-on", "Facom", "Totech", "EGA Master", "Bahco", "Beta", "Stahlwille", "Knipex", "Wera"]:
+            if m.lower() in ex['q'].lower() or m.lower() in ex['r'].lower():
+                parts.append(m)
+    return " ".join(dict.fromkeys(parts))  # Dedupe
 
 def memory_get_active_ref():
-    """Get the currently active reference."""
-    return session_memory["active_ref"]
+    """Get the most recent reference from exchanges."""
+    for ex in reversed(conversation_exchanges):
+        if ex['refs']:
+            return ex['refs'][0]
+    return None
 
-def memory_get_active_context():
-    """Build context string for the ACTIVE topic only."""
-    parts = []
-    if session_memory["active_ref"]:
-        ref_str = session_memory["active_ref"]
-        if session_memory["active_marque"]:
-            ref_str += f" ({session_memory['active_marque']})"
-        parts.append(f"Produit en cours: {ref_str}")
-    if session_memory["product_type"]:
-        parts.append(f"Type: {session_memory['product_type']}")
-    if session_memory["active_topic"]:
-        parts.append(f"Sujet: {session_memory['active_topic']}")
-    if session_memory["recent_refs"]:
-        parts.append(f"Refs récentes: {', '.join(session_memory['recent_refs'])}")
-    if session_memory["last_question"]:
-        parts.append(f"Dernière question: {session_memory['last_question']}")
-    if session_memory["last_answer"]:
-        parts.append(f"Dernière réponse: {session_memory['last_answer'][:300]}")
-    return " | ".join(parts) if parts else ""
+def reformuler_question_avec_contexte(question):
+    """Use GPT to reformulate any question as a standalone query using conversation history.
+    No hardcoded patterns — the LLM understands context naturally."""
+    ctx_block = memory_get_context_block()
+    if not ctx_block:
+        return question  # No history yet, nothing to reformulate
 
-def detecter_question_suivi(question, derniere_q=""):
-    """Detect if the question is a follow-up to the previous exchange."""
-    q = question.lower().strip()
-    words = q.split()
-
-    # If question contains a product reference (letters+digits), check if it's new
-    has_new_ref = bool(re.search(r'[A-Za-z]{1,4}\d{2,6}[A-Za-z0-9]*', question))
-    if has_new_ref:
-        prev_ref = re.search(r'[A-Za-z]{1,4}\d{2,6}[A-Za-z0-9]*', derniere_q or "")
-        new_ref = re.search(r'[A-Za-z]{1,4}\d{2,6}[A-Za-z0-9]*', question)
-        if prev_ref and new_ref and prev_ref.group().lower() == new_ref.group().lower():
-            return True  # Same reference = follow-up
-        return False  # New reference = new topic
-
-    # If question mentions web/internet, it's NOT a follow-up on catalogue
-    if any(w in q for w in ["internet", "web", "google", "en ligne"]):
-        return False
-
-    # Very short answer (1-2 words) = follow-up
-    if len(words) <= 2:
-        return True
-
-    # Short question (3-5 words) with pronouns or deictics = follow-up
-    pronoms_courts = ["ça", "ca", "il", "elle", "le", "la", "les", "ses", "son", "sa",
-                       "ce", "cet", "cette", "ces", "en", "y", "lui", "leur"]
-    if len(words) <= 5 and any(w in pronoms_courts for w in words):
-        return True
-
-    # Check if new question shares key words with the previous one (same topic)
-    if derniere_q:
-        prev_words = set(w.lower().strip(".,;:?!()") for w in derniere_q.split() if len(w) >= 4)
-        new_words = set(w.lower().strip(".,;:?!()") for w in question.split() if len(w) >= 4)
-        common = prev_words & new_words
-        if common:
-            return True  # Shared topic words = follow-up
-
-    # Pronouns / deictics referencing previous context
-    marqueurs_suivi = [
-        "et aussi", "et les", "et le", "et la", "pareil pour", "meme chose",
-        "celui-ci", "celle-ci", "ce produit", "cet outil", "cette reference",
-        "lequel", "laquelle", "lesquels", "lesquelles",
-        "en plus", "autre chose", "quoi d'autre", "d'autres",
-        "plus de details", "plus d'infos", "explique", "precise",
-        "celui la", "celle la", "celui-la", "celle-la",
-        "le meme", "la meme", "les memes",
-        "quel prix", "quelle taille", "quel poids", "quelle couleur",
-        "combien coute", "combien ca coute", "ca fait combien",
-        "il fait", "elle fait", "ils font", "elles font",
-        "c'est quoi", "ca sert a quoi", "a quoi ca sert",
-        "mais avec", "mais en", "mais sur", "plutot", "plutôt",
-        "en metrique", "en mm", "en pouces", "traduis", "convertis",
-        "est il disponible", "est elle disponible", "est-il", "est-elle",
-        "compare", "par rapport",
-    ]
-    return any(m in q for m in marqueurs_suivi)
-
-def reformuler_question_deterministe(question, derniere_q):
-    """Fast deterministic reformulation for common follow-up patterns.
-    Returns reformulated question or None if LLM fallback is needed."""
-    q_low = question.lower().strip()
-    ref = session_memory.get("active_ref", "")
-    marque = session_memory.get("active_marque", "")
-    ptype = session_memory.get("product_type", "")
-    last_answer = session_memory.get("last_answer", "")
-
-    # Build a context tag like "servante KRA rouge Snap-on"
-    ctx_parts = []
-    if ptype:
-        ctx_parts.append(ptype)
-    if ref:
-        ctx_parts.append(ref)
-    if marque:
-        ctx_parts.append(marque)
-    ctx_tag = " ".join(ctx_parts)
-
-    if not ctx_tag:
-        return None  # No context → need LLM
-
-    # "donne une autre", "une autre", "autre", "encore une", "montre une autre"
-    if any(p in q_low for p in ["une autre", "un autre", "encore un", "autre ref",
-                                  "autre référence", "autre reference", "alternative",
-                                  "similaire", "equivalent", "d'autre"]):
-        return f"Donne une autre référence de {ctx_tag} différente de {ref}" if ref else f"Donne une autre référence de {ctx_tag}"
-
-    # "version non FOD", "sans FOD", "version FOD"
-    if "version" in q_low or "variante" in q_low:
-        return f"{question} du {ctx_tag}" if ref not in question.upper() else question
-
-    # "et en bleu?", "en 12 pouces?", "en métrique?" — attribute variants
-    if q_low.startswith("et ") or q_low.startswith("en "):
-        return f"{ctx_tag} {question}"
-
-    # "combien", "quel prix", "quel poids" — specs about current product
-    if any(p in q_low for p in ["combien", "prix", "poids", "dimension", "taille", "longueur"]):
-        if ref and ref.upper() not in question.upper():
-            return f"{question} pour {ctx_tag}"
-
-    # "c'est quoi", "c'est", "c'est laquelle" — referring to current
-    if "c'est" in q_low and len(question.split()) <= 5:
-        return f"{question} concernant {ctx_tag}"
-
-    # "oui", "ok", "non" — very short, inject full context
-    if len(question.split()) <= 2:
-        return f"{question} — concernant {ctx_tag}"
-
-    # Short question without ref → append context
-    if len(question.split()) <= 6 and ref and ref.upper() not in question.upper():
-        return f"{question} ({ctx_tag})"
-
-    return None  # Complex question → need LLM
-
-def reformuler_question_suivi(question, derniere_q, resume):
-    """Reformulate a follow-up question with context. Fast deterministic path first, LLM fallback."""
-    # Try fast deterministic reformulation first
-    fast = reformuler_question_deterministe(question, derniere_q)
-    if fast:
-        print(f"[AGENT] Reformulation rapide: '{question}' -> '{fast}'")
-        return fast
-
-    # LLM fallback for complex cases
     try:
-        active_ctx = memory_get_active_context()
-        context_str = active_ctx if active_ctx else (resume[:150] if resume else "")
         r = client.chat.completions.create(
-            model="gpt-4o-mini", max_tokens=150,
+            model="gpt-4o-mini", max_tokens=200,
             messages=[
                 {"role":"system","content":
-                    "Tu recois une question de suivi dans une conversation sur des outils/produits industriels. "
-                    "Reformule cette question en une question autonome et complete qui integre le contexte. "
-                    "IMPORTANT: garde les references produit exactes et le type de produit. "
-                    "Reponds UNIQUEMENT avec la question reformulee, rien d'autre."},
+                    "Tu es un assistant qui reformule des questions pour les rendre autonomes. "
+                    "L'utilisateur discute d'outillage professionnel (Snap-on, Facom, etc). "
+                    "Tu reçois l'historique de conversation et la nouvelle question. "
+                    "Si la question fait référence à un échange précédent, reformule-la en incluant "
+                    "les références produit, la marque, le type de produit, etc. "
+                    "Si la question est déjà autonome (nouveau sujet), retourne-la telle quelle. "
+                    "Reponds UNIQUEMENT avec la question reformulée, rien d'autre."},
                 {"role":"user","content":
-                    f"Contexte actuel: {context_str}\n"
-                    f"Question precedente: {derniere_q}\n"
-                    f"Question de suivi: {question}\n"
-                    f"Question reformulee:"}
+                    f"{ctx_block}\n\n"
+                    f"Nouvelle question: {question}\n\n"
+                    f"Question reformulée:"}
             ]
         )
         reformulee = r.choices[0].message.content.strip()
-        print(f"[AGENT] Question reformulee LLM: '{question}' -> '{reformulee}'")
-        return reformulee
+        if reformulee and len(reformulee) > 3:
+            print(f"[MEMORY] Reformulation: '{question}' -> '{reformulee}'")
+            return reformulee
+        return question
     except Exception as e:
-        print(f"Reformulation error: {e}")
-        # Ultimate fallback — just append the context
-        ref = session_memory.get("active_ref", "")
-        if ref:
-            return f"{question} (concerne: {ref})"
+        print(f"[MEMORY] Reformulation error: {e}")
+        # Fallback: append search context from memory
+        search_ctx = memory_get_search_context()
+        if search_ctx:
+            return f"{question} {search_ctx}"
         return question
 
-_recent_exchanges = []  # Store last 3 structured exchanges
-
 def mettre_a_jour_resume(question, reponse_courte):
-    """Update conversation context — store last 3 exchanges for richer context."""
-    global resume_conversation, _recent_exchanges
+    """Update conversation memory with this exchange."""
+    global resume_conversation
+    # Add to compressed exchange memory
+    memory_add_exchange(question, reponse_courte)
+    # Keep resume_conversation for backward compat
+    resume_conversation = f"Q: {question[:150]} | R: {reponse_courte[:200]}"
     ref = extraire_reference_from_text(reponse_courte)
-    ptype = detecter_product_type(question + " " + reponse_courte)
-    _recent_exchanges.append({
-        "q": question[:150],
-        "r": reponse_courte[:250],
-        "ref": ref or "",
-        "type": ptype or "",
-    })
-    if len(_recent_exchanges) > 3:
-        _recent_exchanges = _recent_exchanges[-3:]
-    # Build resume from recent exchanges
-    parts = []
-    for i, ex in enumerate(_recent_exchanges):
-        entry = f"Q: {ex['q']} | R: {ex['r']}"
-        if ex['ref']:
-            entry += f" | Ref: {ex['ref']}"
-        if ex['type']:
-            entry += f" | Type: {ex['type']}"
-        parts.append(entry)
-    resume_conversation = " /// ".join(parts)
-    print(f"[MEMORY] Resume ({len(_recent_exchanges)} échanges): {resume_conversation[:120]}...")
+    if ref:
+        resume_conversation += f" | Ref: {ref}"
+    print(f"[MEMORY] Resume mis à jour, {len(conversation_exchanges)} échanges stockés")
 
 def clean_markdown(text):
     """Remove ALL markdown formatting from text for clean display."""
@@ -1358,37 +1152,8 @@ def extraire_reference_from_text(text):
     refs = re.findall(r'\b([A-Z]{1,5}\d{2,6}[A-Z0-9]*)\b', text or "")
     return refs[0] if refs else ""
 
-def detecter_lien_llm(question, derniere_q, resume):
-    """Detect if question is related to previous exchange. Returns (is_linked, question).
-    IMPORTANT: Does NOT modify the question. Context is injected via build_llm_messages instead."""
-    if not derniere_q and not memory_get_active_ref():
-        return False, question
-    try:
-        # Use structured memory context (not the resume which can be polluted)
-        active_ctx = memory_get_active_context()
-        r = client.chat.completions.create(
-            model="gpt-4o-mini", max_tokens=10,
-            messages=[
-                {"role":"system","content":
-                    "Réponds UNIQUEMENT OUI ou NON. "
-                    "La nouvelle question fait-elle référence au même sujet/produit que la question PRÉCÉDENTE IMMÉDIATE? "
-                    "Ignore les sujets plus anciens."},
-                {"role":"user","content":
-                    f"Sujet actif: {active_ctx[:100]}\n"
-                    f"Question précédente: {derniere_q}\n"
-                    f"Nouvelle question: {question}"}
-            ]
-        )
-        resp = r.choices[0].message.content.strip().upper()
-        is_linked = "OUI" in resp
-        print(f"[AGENT] Lien: {is_linked} | Q: {question[:60]} | Ctx: {active_ctx[:60]}")
-        return is_linked, question  # Return UNMODIFIED question
-    except Exception as e:
-        print(f"[AGENT] Erreur lien: {e}")
-        return detecter_question_suivi(question, derniere_q), question
-
 def build_llm_messages(system_prompt, question, contexte, historique, use_previous_context=False):
-    """Build LLM messages with conversation history. Memory injection when linked."""
+    """Build LLM messages with conversation history. ALWAYS injects conversation memory."""
     full_system = system_prompt + "\n\n"
     full_system += (
         "RÈGLE ABSOLUE: ta réponse doit UNIQUEMENT contenir la réponse à la question de l'utilisateur. "
@@ -1401,26 +1166,13 @@ def build_llm_messages(system_prompt, question, contexte, historique, use_previo
         "PAS de markdown. Utilise des phrases complètes.\n\n"
     )
 
-    # Memory injection — ALWAYS inject minimal context, richer when follow-up
-    mem_ctx = memory_get_active_context()
-    if use_previous_context and mem_ctx:
-        # Full context for follow-ups
-        full_system += (
-            "CONTEXTE ACTUEL (produit/sujet en cours de discussion):\n" + mem_ctx + "\n"
-            "IMPORTANT: L'utilisateur pose une question de SUIVI sur ce sujet. "
-            "Utilise ce contexte pour comprendre sa question même si elle est vague.\n\n"
-        )
-        if dernier_contexte_envoye:
-            full_system += (
-                "EXTRAITS PRÉCÉDENTS (utiliser si la question est un suivi):\n"
-                + dernier_contexte_envoye[:2000] + "\n\n"
-            )
-    elif mem_ctx:
-        # Minimal context even for new topics (helps with ambiguous questions)
-        ref = session_memory.get("active_ref", "")
-        ptype = session_memory.get("product_type", "")
-        if ref or ptype:
-            full_system += f"Note: le dernier sujet discuté était: {ref} {ptype}\n\n"
+    # ALWAYS inject conversation memory — the LLM needs context for ALL questions
+    ctx_block = memory_get_context_block()
+    if ctx_block:
+        full_system += ctx_block + "\n\n"
+    # Also inject previous RAG extracts if available (for follow-ups)
+    if use_previous_context and dernier_contexte_envoye:
+        full_system += "EXTRAITS PRÉCÉDENTS:\n" + dernier_contexte_envoye[:1500] + "\n\n"
 
     msgs = [{"role":"system","content":full_system}]
 
@@ -1444,28 +1196,18 @@ def poser_question(question, session_id="default", mode="catalogue"):
     # ── Handle "oui"/"ok" after web proposal → switch to web ──
     if derniere_propose_web and q_low.strip() in ["oui", "ok", "d'accord", "yes", "vas-y", "vasy", "go", "oui merci"]:
         mode = "web"
-        # Build a contextual query instead of sending the raw previous question
-        ctx = memory_get_active_context()
-        if ctx and derniere_question:
-            question = reformuler_question_suivi(derniere_question, derniere_question, resume_conversation)
-        else:
-            question = derniere_question
+        question = reformuler_question_avec_contexte(derniere_question or question)
         q_low = question.lower()
 
-    # ── Agent: detect if question is linked to previous exchange ──
-    is_suivi = False
-    
-    # Use LLM for nuanced detection (only if we have previous context)
-    if derniere_question and resume_conversation:
-        is_suivi, _ = detecter_lien_llm(question, derniere_question, resume_conversation)
-    elif derniere_question:
-        # Fallback to simple detection
-        is_suivi = detecter_question_suivi(question, derniere_question)
-
-    # Reformulate follow-up questions with context
-    if is_suivi and derniere_question:
-        question = reformuler_question_suivi(question, derniere_question, resume_conversation)
-        q_low = question.lower()
+    # ── Reformulate question with conversation context (LLM-based, no hardcoded patterns) ──
+    # Always reformulate when we have conversation history — the LLM decides if context is needed
+    is_suivi = False  # Kept for backward compat (passed to build_llm_messages)
+    if conversation_exchanges:
+        question_reformulee = reformuler_question_avec_contexte(question)
+        if question_reformulee != question:
+            is_suivi = True
+            question = question_reformulee
+            q_low = question.lower()
 
     # Expand vague follow-up using history
     if any(k in q_low for k in ["explorer la gamme","gamme complete","toutes les variantes"]):
@@ -1587,11 +1329,9 @@ def poser_question(question, session_id="default", mode="catalogue"):
         
         if prev_ref and not re.search(r'[A-Z]{1,5}\d{2,6}', question.upper()):
             # User asks for image without specifying a ref → use previous ref
-            marque_ctx = ""
-            if memory_get_active_ref():
-                marque_ctx = session_memory.get("active_marque", "")
             mode = "web"
-            question = f"Image du produit {marque_ctx} {prev_ref}".strip()
+            search_ctx = memory_get_search_context()
+            question = f"Image du produit {search_ctx} {prev_ref}".strip()
             q_low = question.lower()
             demande_image = False
             print(f"[AGENT] Image → web avec ref: {question}")
@@ -1599,9 +1339,6 @@ def poser_question(question, session_id="default", mode="catalogue"):
     reference = detecter_reference(question)
     specs     = extraire_specs(question)
     large     = any(m in mots for m in MOTS_LARGE)
-
-    # Update active topic EARLY so memory is correct for this exchange
-    memory_update_active(question, "", reference)
 
     cle = reference if reference else " ".join(sorted([m for m in mots if len(m) > 4]))[:50]
     historique_recherches[cle] = historique_recherches.get(cle, 0) + 1
@@ -1648,20 +1385,13 @@ def poser_question(question, session_id="default", mode="catalogue"):
 
     # ── Main catalogue search with RAG ──
     # When it's a follow-up with a vague query, enrich the SEARCH query
+    # Enrich search query with memory context (refs, brands from recent exchanges)
     search_question = question
-    if is_suivi:
-        has_ref_in_q = bool(re.search(r'\b[A-Z]{1,5}\d{2,6}[A-Z0-9]*\b', question))
-        if not has_ref_in_q:
-            # Build rich search query from memory
-            search_parts = [question]
-            if memory_get_active_ref():
-                search_parts.append(memory_get_active_ref())
-            if session_memory.get("active_marque"):
-                search_parts.append(session_memory["active_marque"])
-            if session_memory.get("product_type"):
-                search_parts.append(session_memory["product_type"])
-            search_question = " ".join(search_parts)
-            print(f"[RAG] Enriched search: {search_question[:80]}")
+    search_ctx = memory_get_search_context()
+    has_ref_in_q = bool(re.search(r'\b[A-Z]{1,5}\d{2,6}[A-Z0-9]*\b', question))
+    if search_ctx and not has_ref_in_q:
+        search_question = f"{question} {search_ctx}"
+        print(f"[RAG] Enriched search: {search_question[:80]}")
     
     query_en = traduire_query(search_question)
     n_chunks = 20 if large else 15  # Fetch more, then rerank
@@ -1879,17 +1609,11 @@ def poser_question(question, session_id="default", mode="catalogue"):
 
     # ── Mode web ──────────────────────────────────────────────────────────────
     elif mode == "web":
-        # Build web query — ALWAYS enrich with active context
+        # Build web query — enrich with memory context
         web_query = question
-        mem_ctx = memory_get_active_context()
-        if mem_ctx:
-            web_query = question + " (contexte: " + mem_ctx + ")"
-        elif is_suivi and resume_conversation:
-            web_query = question + " (contexte: " + resume_conversation[:150] + ")"
-        elif len(question.split()) < 8 and dernier_contexte_envoye:
-            last_ref = re.search(r'\b([A-Z]{1,4}\d{2,6}[A-Z0-9]*)\b', dernier_contexte_envoye[:500])
-            if last_ref:
-                web_query = question + " " + last_ref.group(1)
+        search_ctx = memory_get_search_context()
+        if search_ctx:
+            web_query = f"{question} {search_ctx}"
         web = recherche_perplexity(web_query)
         if web:
             reponse           = clean_markdown(web)
@@ -1932,20 +1656,12 @@ def poser_question(question, session_id="default", mode="catalogue"):
                     "Ne JAMAIS reciter le resume, le contexte precedent ou les extraits bruts. "
                     "Reponds directement.\n\n"
                 )
-                mem_ctx = memory_get_active_context()
-                if is_suivi and mem_ctx:
-                    vision_system += (
-                        "CONTEXTE ACTUEL:\n" + mem_ctx + "\n"
-                        "IMPORTANT: L'utilisateur pose une question de SUIVI. "
-                        "Utilise ce contexte pour comprendre sa question.\n\n"
-                    )
-                    if dernier_contexte_envoye:
-                        vision_system += "EXTRAITS PRÉCÉDENTS:\n" + dernier_contexte_envoye[:1500] + "\n\n"
-                elif mem_ctx:
-                    ref = session_memory.get("active_ref", "")
-                    ptype = session_memory.get("product_type", "")
-                    if ref or ptype:
-                        vision_system += f"Note: le dernier sujet discuté était: {ref} {ptype}\n\n"
+                # Inject conversation memory
+                ctx_block = memory_get_context_block()
+                if ctx_block:
+                    vision_system += ctx_block + "\n\n"
+                if is_suivi and dernier_contexte_envoye:
+                    vision_system += "EXTRAITS PRÉCÉDENTS:\n" + dernier_contexte_envoye[:1500] + "\n\n"
 
                 text_part = "Extraits catalogue:\n\n" + contexte + "\n\nQuestion: " + question
 
@@ -2114,12 +1830,7 @@ def poser_question(question, session_id="default", mode="catalogue"):
     derniere_question = question_originale
     derniere_propose_web = False  # Reset by default
 
-    # Structured memory: update active topic based on this exchange
-    detected_ref = reference if reference else None
-    active_source = sources_utilisees[0] if sources_utilisees else ""
-    memory_update_active(question_originale, reponse[:500], detected_ref, active_source)
-
-    # Update conversation summary (async-friendly, runs in background)
+    # Update conversation memory with this exchange
     try:
         mettre_a_jour_resume(question_originale, reponse[:300])
     except Exception:
@@ -3477,64 +3188,60 @@ def generer_fiche_produit(body: FicheProduitRequest):
             except Exception as e:
                 print(f"[FICHE] Logo marque non disponible: {e}")
 
-        # Try to get product image from Perplexity
+        # Try to get product image from web (multiple strategies)
+        def try_download_image(url, min_size=2000):
+            """Download image from URL, return bytes or None."""
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = resp.read()
+                if len(data) >= min_size:
+                    return data
+            except Exception:
+                pass
+            return None
+
+        # Strategy 1: Perplexity — ask for multiple URLs
         try:
             img_resp = client_perplexity.chat.completions.create(
-                model="sonar", max_tokens=300,
+                model="sonar", max_tokens=500,
                 messages=[{"role": "user", "content":
-                    f"Find ONE direct image URL (ending in .jpg, .png or .webp) for the product {marque} {ref}. "
-                    f"Reply ONLY with the URL, nothing else. If no image found, reply NONE."}]
+                    f"Find direct image URLs for the product {marque} {ref} (industrial/professional tool). "
+                    f"I need ACTUAL direct image links ending in .jpg, .png, or .webp. "
+                    f"Prefer product photos on white background from official sites or retailers. "
+                    f"List up to 3 URLs, one per line. If nothing found, reply NONE."}]
             )
-            img_url = img_resp.choices[0].message.content.strip()
-            url_match = re.search(r'https?://\S+\.(?:jpg|jpeg|png|webp)', img_url, re.IGNORECASE)
-            if url_match:
-                img_url = url_match.group(0).rstrip('.,;)')
-            if img_url and img_url.startswith("http") and "NONE" not in img_url.upper():
-                req = urllib.request.Request(img_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    product_image_data = resp.read()
-                if len(product_image_data) < 1000:
-                    product_image_data = None
-                else:
-                    print(f"[FICHE] Image produit web: {len(product_image_data)} bytes")
+            img_text = img_resp.choices[0].message.content.strip()
+            if "NONE" not in img_text.upper():
+                urls = re.findall(r'https?://\S+\.(?:jpg|jpeg|png|webp)(?:\?\S*)?', img_text, re.IGNORECASE)
+                for url in urls[:5]:
+                    url = url.rstrip('.,;)\'"]')
+                    img_data = try_download_image(url)
+                    if img_data:
+                        product_image_data = img_data
+                        print(f"[FICHE] Image produit Perplexity: {len(img_data)} bytes from {url[:80]}")
+                        break
         except Exception as e:
-            print(f"[FICHE] Pas d'image web: {e}")
+            print(f"[FICHE] Perplexity image search failed: {e}")
 
-        # Fallback: extract the largest individual image from catalogue page
+        # Strategy 2: Try common manufacturer image URL patterns
         if not product_image_data:
-            try:
-                page_num = None
-                if result.get("page_num"):
-                    page_num = result["page_num"]
-                elif derniers_chunks_trouves:
-                    page_num = derniers_chunks_trouves[0].get("page")
-                if page_num:
-                    doc_cat = fitz.open(PDF_LOCAL)
-                    cat_page = doc_cat[page_num - 1]
-                    images = cat_page.get_images(full=True)
-                    best_img = None
-                    best_area = 0
-                    for img_info in images:
-                        xref = img_info[0]
-                        try:
-                            pix = fitz.Pixmap(doc_cat, xref)
-                            w, h = pix.width, pix.height
-                            if w > 100 and h > 100 and w * h > best_area:
-                                # Convert CMYK/other to RGB if needed
-                                if pix.n - pix.alpha > 3:
-                                    pix = fitz.Pixmap(fitz.csRGB, pix)
-                                best_area = w * h
-                                best_img = pix.tobytes("png")
-                        except Exception:
-                            continue
-                    doc_cat.close()
-                    if best_img:
-                        product_image_data = best_img
-                        print(f"[FICHE] Image produit extraite page {page_num} ({best_area}px)")
-                    else:
-                        print(f"[FICHE] Pas d'image assez grande sur page {page_num}")
-            except Exception as e:
-                print(f"[FICHE] Pas d'image catalogue: {e}")
+            direct_urls = [
+                f"https://store.snapon.com/images/ProductImages/{ref}.jpg",
+                f"https://www.snap-on.com/images/products/{ref}.jpg",
+                f"https://www.facom.fr/medias/sys_master/images/{ref}.jpg",
+            ]
+            for url in direct_urls:
+                img_data = try_download_image(url)
+                if img_data:
+                    product_image_data = img_data
+                    print(f"[FICHE] Image produit direct URL: {len(img_data)} bytes")
+                    break
+
+        if product_image_data:
+            print(f"[FICHE] Image produit trouvée: {len(product_image_data)} bytes")
+        else:
+            print(f"[FICHE] Aucune image produit trouvée pour {marque} {ref}")
 
         # ── Generate PDF ──
         # Template layout (from inspection):
@@ -3608,14 +3315,18 @@ def generer_fiche_produit(body: FicheProduitRequest):
 
                 # Description text — right of image or full width
                 if has_image:
-                    desc_rect = fitz.Rect(235, img_y, 565, img_y + 180)
+                    desc_rect = fitz.Rect(235, img_y, 565, img_y + 200)
                 else:
-                    desc_rect = fitz.Rect(35, img_y, 565, img_y + 120)
+                    desc_rect = fitz.Rect(35, img_y, 565, img_y + 160)
 
-                presentation_text = desc_courte if desc_courte else desc_longue[:500]
+                presentation_text = desc_courte if desc_courte else desc_longue
                 if desc_longue and desc_courte and desc_longue != desc_courte:
-                    presentation_text = desc_courte + "\n\n" + desc_longue[:300]
-                page.insert_textbox(desc_rect, presentation_text[:600], fontsize=10, fontname="helv", color=black, align=0)
+                    presentation_text = desc_courte + "\n\n" + desc_longue
+                # insert_textbox auto-truncates to fit the rect — use fontsize 9 for more text
+                rc = page.insert_textbox(desc_rect, presentation_text, fontsize=9, fontname="helv", color=black, align=0)
+                # If text overflowed (rc < 0), retry with smaller font
+                if rc < 0:
+                    page.insert_textbox(desc_rect, presentation_text, fontsize=8, fontname="helv", color=black, align=0)
 
                 # ═══ CARACTÉRISTIQUES ═══
                 carac_y = img_y + (230 if has_image else 140)
@@ -3639,8 +3350,8 @@ def generer_fiche_produit(body: FicheProduitRequest):
                         # Split on first ":" for key:value display
                         if ":" in carac:
                             key, val = carac.split(":", 1)
-                            page.insert_text(fitz.Point(30, carac_y + 11), key.strip()[:40], fontsize=10, fontname="hebo", color=black)
-                            page.insert_text(fitz.Point(230, carac_y + 11), val.strip()[:60], fontsize=10, fontname="helv", color=gray)
+                            page.insert_text(fitz.Point(30, carac_y + 11), key.strip()[:50], fontsize=9, fontname="hebo", color=black)
+                            page.insert_text(fitz.Point(220, carac_y + 11), val.strip()[:80], fontsize=9, fontname="helv", color=gray)
                         else:
                             page.insert_text(fitz.Point(30, carac_y + 11), carac.strip()[:80], fontsize=10, fontname="helv", color=black)
 
@@ -3696,8 +3407,10 @@ def generer_fiche_produit(body: FicheProduitRequest):
             else:
                 desc_rect = fitz.Rect(35, y, 565, y + 120)
 
-            presentation_text = (desc_courte + "\n\n" + desc_longue[:300]) if desc_longue else desc_courte
-            page.insert_textbox(desc_rect, presentation_text[:600], fontsize=10, fontname="helv", color=black, align=0)
+            presentation_text = (desc_courte + "\n\n" + desc_longue) if desc_longue else desc_courte
+            rc = page.insert_textbox(desc_rect, presentation_text, fontsize=9, fontname="helv", color=black, align=0)
+            if rc < 0:
+                page.insert_textbox(desc_rect, presentation_text, fontsize=8, fontname="helv", color=black, align=0)
             y += 200
 
             # Characteristics
