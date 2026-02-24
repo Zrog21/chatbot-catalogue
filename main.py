@@ -990,63 +990,108 @@ session_memory = {
     "active_marque": "",      # Currently discussed brand
     "active_topic": "",       # Current topic summary (e.g. "cliquet Snap-on T72FOD")
     "active_source": "",      # Source catalogue being discussed
+    "product_type": "",       # Type of product (cliquet, douille, clé, etc.)
+    "recent_refs": [],        # Last 3 references discussed
     "history": [],            # [{question, ref, topic, timestamp}] — last 10 exchanges
 }
 
+def detecter_product_type(text):
+    """Detect product type from text using keyword matching (FR+EN)."""
+    text_low = text.lower()
+    type_keywords = {
+        "cliquet": ["cliquet", "ratchet", "t72", "t36", "tl72", "thl72"],
+        "douille": ["douille", "socket", "sw", "sfs", "tms", "tm", "tsm"],
+        "clé": ["clé", "cle", "clef", "wrench", "key", "soex", "flank", "oexm", "goex"],
+        "tournevis": ["tournevis", "screwdriver", "sdd", "sgd"],
+        "pince": ["pince", "plier", "knipex"],
+        "servante": ["servante", "toolbox", "kra", "krsc", "roll cab", "coffre"],
+        "embout": ["embout", "bit", "torx", "tamper"],
+        "rallonge": ["rallonge", "extension", "fx"],
+        "marteau": ["marteau", "hammer", "hbfe", "hbbd"],
+        "extracteur": ["extracteur", "extractor", "puller"],
+        "clé dynamométrique": ["dynamométrique", "dynamometrique", "torque wrench", "techangle", "atech"],
+    }
+    for ptype, keywords in type_keywords.items():
+        if any(kw in text_low for kw in keywords):
+            return ptype
+    return ""
+
 def memory_update_active(question, reponse="", reference=None, source=""):
     """Update active topic based on current exchange.
-    Key insight: if a new reference or topic appears, REPLACE the active topic."""
+    Key insight: if a new reference or topic appears, REPLACE the active topic.
+    Prefix-matching: T72 is a prefix of T72FOD → continuation, keep most specific."""
     q_low = question.lower()
-    
+
     # Extract references from question + response
     refs = re.findall(r'\b([A-Z]{1,5}\d{2,6}[A-Z0-9]*)\b', question + " " + (reponse or "")[:300])
-    
+
     # Detect brand
     marque = ""
     for m in ["Snap-on", "Facom", "Totech", "EGA Master", "Bahco", "Beta", "Stahlwille", "Knipex", "Wera", "CAB"]:
         if m.lower() in q_low or m.lower() in (reponse or "").lower()[:300]:
             marque = m
             break
-    
+
     new_ref = reference or (refs[0] if refs else None)
-    
+
+    # Detect product type from question + response
+    ptype = detecter_product_type(question + " " + (reponse or "")[:300])
+    if ptype:
+        session_memory["product_type"] = ptype
+
     # Determine if this is a NEW topic or continuation
     is_new_topic = False
-    if new_ref and new_ref != session_memory["active_ref"]:
-        # New reference mentioned → definitely a new topic
-        is_new_topic = True
-    elif not new_ref and session_memory["active_ref"]:
+    active_ref = session_memory["active_ref"]
+    if new_ref and new_ref != active_ref:
+        # Check prefix-matching: if one ref is prefix of the other, it's a CONTINUATION
+        if active_ref and (active_ref.startswith(new_ref) or new_ref.startswith(active_ref)):
+            # Continuation — keep the most specific (longest) reference
+            new_ref = new_ref if len(new_ref) >= len(active_ref) else active_ref
+            print(f"[MEMORY] Prefix match: continuation, ref={new_ref}")
+        else:
+            # Truly different reference → new topic
+            is_new_topic = True
+    elif not new_ref and active_ref:
         # No reference in question — is it a follow-up or new topic?
-        active_ref_lower = session_memory["active_ref"].lower()
-        # Check if the question mentions the active product or related terms
+        active_ref_lower = active_ref.lower()
         question_mentions_active = (
             active_ref_lower in q_low or
-            (session_memory["active_marque"] and session_memory["active_marque"].lower() in q_low)
+            (session_memory["active_marque"] and session_memory["active_marque"].lower() in q_low) or
+            (session_memory["product_type"] and session_memory["product_type"] in q_low)
         )
         if not question_mentions_active:
-            # Check for follow-up patterns (short questions, pronouns, "et...", "c'est...")
             suivi_patterns = ["c'est", "est-ce", "et la", "et le", "et les", "aussi", "même",
                             "compatible", "version", "oui", "non", "ok", "d'accord", "merci",
-                            "quel", "combien", "pourquoi", "comment", "où", "quand"]
+                            "quel", "combien", "pourquoi", "comment", "où", "quand",
+                            "non fod", "sans fod", "avec fod", "version fod"]
             is_follow_up_pattern = any(p in q_low for p in suivi_patterns)
-            # Very short questions (1-3 words) without new nouns are usually follow-ups
             is_very_short = len(question.split()) <= 3
-            
+
             if not is_follow_up_pattern and not is_very_short:
                 is_new_topic = True
-    
-    if is_new_topic or not session_memory["active_ref"]:
+
+    if is_new_topic or not active_ref:
         session_memory["active_ref"] = new_ref
         session_memory["active_marque"] = marque
         session_memory["active_topic"] = question[:100]
         if source:
             session_memory["active_source"] = source
-        print(f"[MEMORY] Nouveau sujet: ref={new_ref} marque={marque} topic={question[:60]}")
+        print(f"[MEMORY] Nouveau sujet: ref={new_ref} marque={marque} type={ptype} topic={question[:60]}")
     else:
-        # Update marque if detected
+        # Continuation — update ref if more specific, update marque if detected
+        if new_ref and (not active_ref or len(new_ref) > len(active_ref)):
+            session_memory["active_ref"] = new_ref
         if marque and not session_memory["active_marque"]:
             session_memory["active_marque"] = marque
-    
+
+    # Update recent_refs (last 3 unique)
+    if new_ref:
+        rr = session_memory["recent_refs"]
+        if new_ref in rr:
+            rr.remove(new_ref)
+        rr.append(new_ref)
+        session_memory["recent_refs"] = rr[-3:]
+
     # Add to history
     session_memory["history"].append({
         "question": question[:100], "ref": new_ref, "topic": session_memory["active_topic"],
@@ -1067,8 +1112,12 @@ def memory_get_active_context():
         if session_memory["active_marque"]:
             ref_str += f" ({session_memory['active_marque']})"
         parts.append(f"Produit en cours: {ref_str}")
+    if session_memory["product_type"]:
+        parts.append(f"Type: {session_memory['product_type']}")
     if session_memory["active_topic"]:
         parts.append(f"Sujet: {session_memory['active_topic']}")
+    if session_memory["recent_refs"]:
+        parts.append(f"Refs récentes: {', '.join(session_memory['recent_refs'])}")
     return " | ".join(parts) if parts else ""
 
 def detecter_question_suivi(question, derniere_q=""):
@@ -1154,42 +1203,32 @@ def reformuler_question_suivi(question, derniere_q, resume):
         print(f"Reformulation error: {e}")
         return question
 
-def mettre_a_jour_resume(question, reponse_courte):
-    """Update conversation context — simple last-exchange memo, no cumulative GPT summary."""
-    global resume_conversation
-    # Store ONLY the last exchange — prevents topic pollution across turns
-    resume_conversation = f"Dernier échange — Q: {question[:150]} | R: {reponse_courte[:250]}"
-    ref = extraire_reference_from_text(reponse_courte)
-    if ref:
-        resume_conversation += f" | Ref: {ref}"
-    print(f"[MEMORY] Resume: {resume_conversation[:120]}...")
-    return  # Skip the old GPT-based cumulative summary below
+_recent_exchanges = []  # Store last 3 structured exchanges
 
-    # --- DEAD CODE (kept for reference, never executed) ---
-    try:
-        r = client.chat.completions.create(
-            model="gpt-4o-mini", max_tokens=300,
-            messages=[
-                {"role":"system","content":
-                    "Mets à jour ce résumé de conversation en 3-5 phrases. "
-                    "IMPORTANT: garde TOUTES les infos clés: "
-                    "- Références produit exactes (T72, KRA4107, etc) "
-                    "- Valeurs numériques (dimensions, prix, poids) "
-                    "- Caractéristiques spécifiques discutées "
-                    "- Pages du catalogue citées "
-                    "- Préférences de l'utilisateur "
-                    "Réponds UNIQUEMENT avec le résumé mis à jour."},
-                {"role":"user","content":
-                    f"Résumé actuel: {resume_conversation or 'Début de conversation.'}\n"
-                    f"Utilisateur: {question}\n"
-                    f"Assistant: {reponse_courte[:400]}\n"
-                    f"Nouveau résumé:"}
-            ]
-        )
-        resume_conversation = r.choices[0].message.content.strip()
-        print(f"[AGENT] Résumé: {resume_conversation[:150]}...")
-    except Exception:
-        resume_conversation = f"Discussion sur: {question}. {reponse_courte[:200]}"
+def mettre_a_jour_resume(question, reponse_courte):
+    """Update conversation context — store last 3 exchanges for richer context."""
+    global resume_conversation, _recent_exchanges
+    ref = extraire_reference_from_text(reponse_courte)
+    ptype = detecter_product_type(question + " " + reponse_courte)
+    _recent_exchanges.append({
+        "q": question[:150],
+        "r": reponse_courte[:250],
+        "ref": ref or "",
+        "type": ptype or "",
+    })
+    if len(_recent_exchanges) > 3:
+        _recent_exchanges = _recent_exchanges[-3:]
+    # Build resume from recent exchanges
+    parts = []
+    for i, ex in enumerate(_recent_exchanges):
+        entry = f"Q: {ex['q']} | R: {ex['r']}"
+        if ex['ref']:
+            entry += f" | Ref: {ex['ref']}"
+        if ex['type']:
+            entry += f" | Type: {ex['type']}"
+        parts.append(entry)
+    resume_conversation = " /// ".join(parts)
+    print(f"[MEMORY] Resume ({len(_recent_exchanges)} échanges): {resume_conversation[:120]}...")
 
 def clean_markdown(text):
     """Remove ALL markdown formatting from text for clean display."""
@@ -1320,7 +1359,12 @@ def poser_question(question, session_id="default", mode="catalogue"):
     # ── Handle "oui"/"ok" after web proposal → switch to web ──
     if derniere_propose_web and q_low.strip() in ["oui", "ok", "d'accord", "yes", "vas-y", "vasy", "go", "oui merci"]:
         mode = "web"
-        question = derniere_question  # Re-send the original question via web
+        # Build a contextual query instead of sending the raw previous question
+        ctx = memory_get_active_context()
+        if ctx and derniere_question:
+            question = reformuler_question_suivi(derniere_question, derniere_question, resume_conversation)
+        else:
+            question = derniere_question
         q_low = question.lower()
 
     # ── Agent: detect if question is linked to previous exchange ──
@@ -1332,6 +1376,11 @@ def poser_question(question, session_id="default", mode="catalogue"):
     elif derniere_question:
         # Fallback to simple detection
         is_suivi = detecter_question_suivi(question, derniere_question)
+
+    # Reformulate follow-up questions with context
+    if is_suivi and derniere_question:
+        question = reformuler_question_suivi(question, derniere_question, resume_conversation)
+        q_low = question.lower()
 
     # Expand vague follow-up using history
     if any(k in q_low for k in ["explorer la gamme","gamme complete","toutes les variantes"]):
@@ -1740,13 +1789,14 @@ def poser_question(question, session_id="default", mode="catalogue"):
 
     # ── Mode web ──────────────────────────────────────────────────────────────
     elif mode == "web":
-        # Build web query — enrich with context if question is linked to previous
+        # Build web query — ALWAYS enrich with active context
         web_query = question
-        if is_suivi and resume_conversation:
-            # Question is linked to previous — enrich with conversation context
+        mem_ctx = memory_get_active_context()
+        if mem_ctx:
+            web_query = question + " (contexte: " + mem_ctx + ")"
+        elif is_suivi and resume_conversation:
             web_query = question + " (contexte: " + resume_conversation[:150] + ")"
         elif len(question.split()) < 8 and dernier_contexte_envoye:
-            # Short question — add reference if available
             last_ref = re.search(r'\b([A-Z]{1,4}\d{2,6}[A-Z0-9]*)\b', dernier_contexte_envoye[:500])
             if last_ref:
                 web_query = question + " " + last_ref.group(1)
@@ -2136,7 +2186,20 @@ body{font-family:'Nunito','Century Gothic',Arial,sans-serif;background:var(--gra
 .m{border-radius:4px;font-size:14px;line-height:1.65;word-break:break-word}
 .u{background:var(--orange);color:white;align-self:flex-end;border-bottom-right-radius:0;padding:11px 15px;font-weight:600;white-space:pre-wrap;max-width:75%}
 .b{background:var(--white);border:1px solid var(--border);align-self:flex-start;border-bottom-left-radius:0;box-shadow:0 1px 3px rgba(0,0,0,0.06);overflow:visible;width:fit-content;max-width:82%}
-.msg-body{padding:13px 15px;overflow-wrap:break-word}
+.msg-body{padding:13px 15px;overflow-wrap:break-word;position:relative}
+.copy-btn{position:absolute;top:6px;right:6px;background:none;border:none;cursor:pointer;opacity:0;transition:opacity 0.15s;font-size:14px;padding:2px 5px;border-radius:4px;color:var(--muted)}
+.copy-btn:hover{background:var(--gray);color:var(--orange)}
+.b:hover .copy-btn{opacity:0.6}
+.copy-btn.copied{opacity:1;color:#27ae60}
+.edit-btn{position:absolute;top:4px;right:4px;background:none;border:none;cursor:pointer;opacity:0;transition:opacity 0.15s;font-size:13px;padding:2px 5px;border-radius:4px;color:rgba(255,255,255,0.7)}
+.edit-btn:hover{color:white}
+.u:hover .edit-btn{opacity:0.8}
+.u{position:relative}
+.edit-area{width:100%;background:white;color:var(--text);border:none;border-radius:4px;padding:8px;font-family:inherit;font-size:14px;resize:vertical;min-height:40px}
+.edit-actions{display:flex;gap:6px;margin-top:6px;justify-content:flex-end}
+.edit-actions button{padding:4px 12px;border-radius:4px;border:none;cursor:pointer;font-size:12px;font-weight:600;font-family:inherit}
+.edit-send{background:white;color:var(--orange)}
+.edit-cancel{background:rgba(255,255,255,0.3);color:white}
 .msg-meta{display:flex;align-items:center;gap:8px;padding:6px 13px;background:var(--gray);border-top:1px solid var(--border);flex-wrap:wrap;font-size:11px}
 .meta-source{color:var(--muted);font-weight:600}
 .meta-source span{color:var(--orange)}
@@ -2357,7 +2420,7 @@ function afficherBienvenue(){
     }
     ajouterBotMsg(
       'Bonjour ! Je suis votre assistant catalogue AMDP. Posez-moi une question sur un produit, une reference ou une gamme.',
-      [],[],null,null,null,false,sugg
+      [],[],null,null,null,false,''
     );
     if(inp)inp.focus();
   };
@@ -2567,6 +2630,10 @@ function ajouterBotMsg(texte,sources,suggestions,fiabilite,pageNum,imageB64,from
   var body=document.createElement('div');
   body.className='msg-body';
   body.innerHTML=renderText(texte);
+  var cpBtn=document.createElement('button');
+  cpBtn.className='copy-btn';cpBtn.textContent='\u{1F4CB}';cpBtn.title='Copier';
+  (function(t,b){cpBtn.onclick=function(e){e.stopPropagation();navigator.clipboard.writeText(t).then(function(){b.textContent='Copié !';b.classList.add('copied');setTimeout(function(){b.textContent='\u{1F4CB}';b.classList.remove('copied');},1500);});}})(texte,cpBtn);
+  body.appendChild(cpBtn);
   if(welcomeSugg){
     var card=document.createElement('div');
     card.className='welcome-sugg';
@@ -2724,6 +2791,32 @@ if(imgInput){
 }
 function clearImage(){pendingImage=null;imgPreview.style.display='none';}
 
+function editMessage(um,origText){
+  var allMsgs=Array.from(msgs.children);
+  var idx=allMsgs.indexOf(um);
+  um.innerHTML='';um.style.maxWidth='85%';
+  var ta=document.createElement('textarea');ta.className='edit-area';ta.value=origText;
+  var acts=document.createElement('div');acts.className='edit-actions';
+  var sendBtn=document.createElement('button');sendBtn.className='edit-send';sendBtn.textContent='Envoyer';
+  var cancelBtn=document.createElement('button');cancelBtn.className='edit-cancel';cancelBtn.textContent='Annuler';
+  acts.appendChild(cancelBtn);acts.appendChild(sendBtn);
+  um.appendChild(ta);um.appendChild(acts);
+  ta.focus();ta.setSelectionRange(ta.value.length,ta.value.length);
+  cancelBtn.onclick=function(){um.innerHTML='';um.textContent=origText;addEditBtn(um,origText);um.style.maxWidth='75%';};
+  sendBtn.onclick=function(){
+    var nq=ta.value.trim();if(!nq)return;
+    // Remove all messages after this one
+    while(msgs.lastChild&&msgs.lastChild!==um)msgs.removeChild(msgs.lastChild);
+    um.innerHTML='';um.textContent=nq;addEditBtn(um,nq);um.style.maxWidth='75%';
+    inp.value=nq;envoyer();
+  };
+}
+function addEditBtn(um,txt){
+  var eb=document.createElement('button');eb.className='edit-btn';eb.textContent='\u270F\uFE0F';eb.title='Modifier';
+  eb.onclick=function(e){e.stopPropagation();editMessage(um,txt);};
+  um.appendChild(eb);
+}
+
 function envoyer(){
   if(!inp||!sbtn)return;
   var q=inp.value.trim();
@@ -2733,16 +2826,18 @@ function envoyer(){
   var um=document.createElement('div');um.className='m u';
   if(pendingImage){
     um.innerHTML='<div>'+q+'</div><img src="'+pendingImage+'" style="max-height:80px;border-radius:4px;margin-top:6px"/>';
-  }else{um.textContent=q;}
+  }else{um.textContent=q;addEditBtn(um,q);}
   msgs.appendChild(um);msgs.scrollTop=msgs.scrollHeight;
   inp.value='';sbtn.disabled=true;
   var attente=document.createElement('div');attente.className='m b';
-  attente.innerHTML='<div class="msg-body" style="color:#aaa;font-style:italic">Recherche en cours...</div>';
+  attente.innerHTML='<div class="msg-body" style="color:#aaa;font-style:italic">Recherche en cours...<br><a class="cancel-link" style="font-size:11px;color:#bbb;cursor:pointer;text-decoration:none;transition:color 0.15s">Annuler</a></div>';
   msgs.appendChild(attente);msgs.scrollTop=msgs.scrollHeight;
+  var activeXhr=null;
+  attente.querySelector('.cancel-link').onclick=function(){if(activeXhr){activeXhr.abort();attente.remove();sbtn.disabled=false;inp.focus();}};
 
   if(pendingImage){
     // Send image via /question-image endpoint
-    var xhr=new XMLHttpRequest();
+    var xhr=new XMLHttpRequest();activeXhr=xhr;
     xhr.open('POST','/question-image',true);
     xhr.setRequestHeader('Content-Type','application/json');
     xhr.onload=function(){
@@ -2760,7 +2855,7 @@ function envoyer(){
     xhr.send(JSON.stringify({question:q,mode:currentMode,image:pendingImage}));
     clearImage();
   }else{
-    var xhr=new XMLHttpRequest();
+    var xhr=new XMLHttpRequest();activeXhr=xhr;
     xhr.open('POST','/question',true);
     xhr.setRequestHeader('Content-Type','application/json');
     xhr.onload=function(){
@@ -3307,10 +3402,9 @@ def generer_fiche_produit(body: FicheProduitRequest):
         except Exception as e:
             print(f"[FICHE] Pas d'image web: {e}")
 
-        # Fallback: extract image from catalogue page
+        # Fallback: extract the largest individual image from catalogue page
         if not product_image_data:
             try:
-                # Search for the product page
                 page_num = None
                 if result.get("page_num"):
                     page_num = result["page_num"]
@@ -3319,10 +3413,28 @@ def generer_fiche_produit(body: FicheProduitRequest):
                 if page_num:
                     doc_cat = fitz.open(PDF_LOCAL)
                     cat_page = doc_cat[page_num - 1]
-                    pix = cat_page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                    product_image_data = pix.tobytes("png")
+                    images = cat_page.get_images(full=True)
+                    best_img = None
+                    best_area = 0
+                    for img_info in images:
+                        xref = img_info[0]
+                        try:
+                            pix = fitz.Pixmap(doc_cat, xref)
+                            w, h = pix.width, pix.height
+                            if w > 100 and h > 100 and w * h > best_area:
+                                # Convert CMYK/other to RGB if needed
+                                if pix.n - pix.alpha > 3:
+                                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                                best_area = w * h
+                                best_img = pix.tobytes("png")
+                        except Exception:
+                            continue
                     doc_cat.close()
-                    print(f"[FICHE] Image catalogue page {page_num}")
+                    if best_img:
+                        product_image_data = best_img
+                        print(f"[FICHE] Image produit extraite page {page_num} ({best_area}px)")
+                    else:
+                        print(f"[FICHE] Pas d'image assez grande sur page {page_num}")
             except Exception as e:
                 print(f"[FICHE] Pas d'image catalogue: {e}")
 
